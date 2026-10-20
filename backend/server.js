@@ -1,6 +1,8 @@
-
 const express = require("express");
 const cors = require("cors");
+const multer = require("multer");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -8,7 +10,7 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-// Demonstration data: simulated resources stored in memory
+// ---------- DEMONSTRATION DATA (simulated, in-memory) ----------
 function makeResource(id, name, type, location, distance, status) {
   return { id, name, type, location, distance, status };
 }
@@ -26,12 +28,12 @@ const initialResources = [
 ];
 
 let resources = JSON.parse(JSON.stringify(initialResources));
-let requests = [];
-let events = [];
+let requests = []; // newest first
+let events = []; // oldest first
 let requestCounter = 0;
 let eventCounter = 0;
 
-// Add an activity to the timeline
+// ---------- HELPERS ----------
 function addEvent(icon, message) {
   eventCounter += 1;
   events.push({
@@ -42,25 +44,25 @@ function addEvent(icon, message) {
   });
 }
 
-// Smart matching: select the nearest available resource of the requested type
+// Smart Resource Matching (rule-based, NOT AI):
+// 1. filter by type  2. keep AVAILABLE only  3. sort by distance  4. pick nearest
 function findBestMatch(type) {
   const candidates = resources
     .filter((r) => r.type === type && r.status === "AVAILABLE")
     .sort((a, b) => a.distance - b.distance);
-
   return candidates.length > 0 ? { ...candidates[0] } : null;
 }
 
-// Refresh matches for requests that have not yet been assigned
+// Keep matches fresh for requests still searching
 function refreshMatches() {
-  requests.forEach((request) => {
-    if (request.status === "SEARCHING") {
-      request.match = findBestMatch(request.resourceType);
+  requests.forEach((req) => {
+    if (req.status === "SEARCHING") {
+      req.match = findBestMatch(req.resourceType);
     }
   });
 }
 
-// Health check
+// ---------- ROUTES ----------
 app.get("/api/health", (req, res) => {
   res.json({
     status: "ONLINE",
@@ -69,30 +71,26 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Get all resources
 app.get("/api/resources", (req, res) => {
   res.json(resources);
 });
 
-// Get all requests, newest first
 app.get("/api/requests", (req, res) => {
   refreshMatches();
   res.json(requests);
 });
 
-// Get activity timeline
 app.get("/api/events", (req, res) => {
   res.json(events);
 });
 
-// Create an emergency resource request
 app.post("/api/requests", (req, res) => {
   const { resourceType, location, priority } = req.body;
 
   if (!resourceType || !location || !priority) {
-    return res.status(400).json({
-      error: "resourceType, location and priority are required",
-    });
+    return res
+      .status(400)
+      .json({ error: "resourceType, location and priority are required" });
   }
 
   requestCounter += 1;
@@ -115,12 +113,8 @@ app.post("/api/requests", (req, res) => {
     "\u{1F6A8}",
     `Emergency request created: ${resourceType} needed in ${location} (${priority})`
   );
-
   if (match) {
-    addEvent(
-      "\u{1F9E0}",
-      `Smart match found: ${match.name} (${match.distance} km)`
-    );
+    addEvent("\u{1F9E0}", `Smart match found: ${match.name} (${match.distance} km)`);
   } else {
     addEvent("\u{26A0}", `No available ${resourceType} found`);
   }
@@ -128,30 +122,19 @@ app.post("/api/requests", (req, res) => {
   res.status(201).json(newRequest);
 });
 
-// Assign a matched resource to an emergency request
 app.post("/api/assign", (req, res) => {
   const { requestId, resourceId } = req.body;
 
   const request = requests.find((r) => r.id === requestId);
-
-  if (!request) {
-    return res.status(404).json({ error: "Request not found" });
-  }
-
+  if (!request) return res.status(404).json({ error: "Request not found" });
   if (request.status !== "SEARCHING") {
     return res.status(400).json({ error: "Request is already assigned" });
   }
 
   const resource = resources.find((r) => r.id === resourceId);
-
-  if (!resource) {
-    return res.status(404).json({ error: "Resource not found" });
-  }
-
+  if (!resource) return res.status(404).json({ error: "Resource not found" });
   if (resource.status !== "AVAILABLE") {
-    return res.status(409).json({
-      error: "Resource is no longer available",
-    });
+    return res.status(409).json({ error: "Resource is no longer available" });
   }
 
   resource.status = "EN ROUTE";
@@ -165,18 +148,63 @@ app.post("/api/assign", (req, res) => {
   res.json({ request, resource });
 });
 
-// Reset the demo to its original state
 app.post("/api/reset", (req, res) => {
   resources = JSON.parse(JSON.stringify(initialResources));
   requests = [];
   events = [];
   requestCounter = 0;
   eventCounter = 0;
-
   res.json({ message: "Demo data reset" });
 });
 
-// Start the server
+// ---------- S3 INCIDENT REPORT UPLOAD ----------
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+});
+
+const S3_BUCKET = process.env.S3_BUCKET;
+const s3 = new S3Client({ region: process.env.AWS_REGION || "ap-south-1" });
+
+app.post("/api/incident-report", upload.single("file"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "Please choose a file to upload" });
+  }
+  if (!S3_BUCKET) {
+    return res.status(503).json({
+      error: "S3 is not configured on this server (set S3_BUCKET). Local demo mode.",
+    });
+  }
+
+  const safeName = req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const key = `incident-reports/${Date.now()}-${safeName}`;
+
+  try {
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: key,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype,
+      })
+    );
+    addEvent("\u{2601}", `Incident report stored in Amazon S3: ${safeName}`);
+    res.status(201).json({ message: "Stored in S3", key, bucket: S3_BUCKET });
+  } catch (err) {
+    console.error("S3 upload failed:", err.message);
+    res.status(500).json({ error: "S3 upload failed: " + err.message });
+  }
+});
+
+// ---------- SERVE BUILT FRONTEND (used on EC2 after "npm run build") ----------
+app.use(express.static(path.join(__dirname, "../frontend/dist")));
+app.use((req, res) => {
+  res.sendFile(path.join(__dirname, "../frontend/dist/index.html"), (err) => {
+    if (err) res.status(404).send("Frontend build not found. Run npm run build in frontend/.");
+  });
+});
+
+
 app.listen(PORT, () => {
   console.log(`Backend running at http://localhost:${PORT}`);
 });

@@ -1,7 +1,7 @@
 
 import { useEffect, useState } from "react";
 import "./App.css";
-
+import UploadReport from "./UploadReport.jsx";
 const API = "/api";
 
 const E = {
@@ -418,6 +418,7 @@ export default function App() {
           ))}
         </ul>
       </section>
+            <UploadReport />
 
       <footer className="footer">
         Prototype | Simulated emergency resources | Demonstration data only
